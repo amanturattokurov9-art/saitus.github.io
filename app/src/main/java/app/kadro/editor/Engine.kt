@@ -158,6 +158,9 @@ object Engine {
         p: Project, clip: Clip, startMs: Long, w: Int, h: Int, burnText: Boolean,
     ): List<Effect> {
         val fx = ArrayList<Effect>()
+        // Geometry goes first. Media3 folds neighbouring matrix steps into a single GPU pass, so
+        // turning, fitting to the canvas and zooming cost one draw, and every later step (colour,
+        // text) works on the small canvas instead of the full 4K source frame.
         if (clip.rotation % 360 != 0 || clip.mirror) {
             fx += ScaleAndRotateTransformation.Builder()
                 .setScale(if (clip.mirror) -1f else 1f, 1f)
@@ -165,17 +168,17 @@ object Engine {
                 .setRotationDegrees(-clip.rotation.toFloat())
                 .build()
         }
+        fx += Presentation.createForWidthAndHeight(
+            w, h,
+            if (clip.fill) Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP else Presentation.LAYOUT_SCALE_TO_FIT,
+        )
+        if (clip.zoom != 1f) fx += Zoom(clip.zoom)
         Looks.matrix(clip.look)?.let { fx += LookMatrix(it) }
         if (clip.brightness != 0f) fx += Brightness(clip.brightness.coerceIn(-1f, 1f))
         if (clip.contrast != 0f) fx += Contrast(clip.contrast.coerceIn(-0.99f, 0.99f))
         if (clip.saturation != 0f) {
             fx += HslAdjustment.Builder().adjustSaturation(clip.saturation.coerceIn(-100f, 100f)).build()
         }
-        fx += Presentation.createForWidthAndHeight(
-            w, h,
-            if (clip.fill) Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP else Presentation.LAYOUT_SCALE_TO_FIT,
-        )
-        if (clip.zoom != 1f) fx += Zoom(clip.zoom)
         val endMs = startMs + clip.durMs
         if (clip.fadeInMs > 0 || clip.fadeOutMs > 0) {
             fx += EdgeFade(startMs * 1000, endMs * 1000, clip.fadeInMs * 1000, clip.fadeOutMs * 1000)
@@ -189,19 +192,26 @@ object Engine {
         return fx
     }
 
+    /** Where a clip's media is read from, and how long that file is. */
+    class Source(val uri: Uri, val durationMs: Long, val mime: String)
+
+    private fun original(c: Clip) = Source(Uri.parse(c.uri), c.sourceMs, c.mime)
+
     private fun clipItem(
-        p: Project, clip: Clip, startMs: Long, w: Int, h: Int, burnText: Boolean, maxFps: Int,
+        p: Project, clip: Clip, src: Source, startMs: Long, w: Int, h: Int, burnText: Boolean, maxFps: Int,
     ): EditedMediaItem {
-        val media = MediaItem.Builder().setUri(Uri.parse(clip.uri)).setMediaId(clip.id)
-        if (clip.mime.isNotBlank()) media.setMimeType(clip.mime)
+        val media = MediaItem.Builder().setUri(src.uri).setMediaId(clip.id)
+        if (src.mime.isNotBlank()) media.setMimeType(src.mime)
         val audio = ArrayList<AudioProcessor>()
         if (clip.isImage) {
             media.setImageDurationMs(clip.outMs - clip.inMs)
         } else {
+            // Never ask for more than the file holds; the player waits forever for missing frames.
+            val end = clip.outMs.coerceAtMost(src.durationMs)
             media.setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(clip.inMs)
-                    .setEndPositionMs(clip.outMs)
+                    .setStartPositionMs(clip.inMs.coerceAtMost((end - 1).coerceAtLeast(0)))
+                    .setEndPositionMs(end)
                     .build(),
             )
             if (clip.volume != 1f) audio += GainProcessor(FixedGain(clip.volume))
@@ -211,7 +221,7 @@ object Engine {
         if (clip.isImage) {
             item.setDurationUs((clip.outMs - clip.inMs) * 1000).setFrameRate(maxFps)
         } else {
-            item.setDurationUs(clip.sourceMs * 1000).setFrameRate(maxFps)
+            item.setDurationUs(src.durationMs * 1000).setFrameRate(maxFps)
             if (clip.speed != 1f) item.setSpeed(FixedSpeed(clip.speed))
         }
         return item.build()
@@ -222,11 +232,18 @@ object Engine {
      * exporter, so what is seen while editing is what gets written to the file. Text is drawn by
      * the editor UI during preview ([burnText] = false) and burnt into frames on export.
      */
-    fun compose(p: Project, shortSide: Int, burnText: Boolean, maxFps: Int = 30): Composition {
+    fun compose(
+        p: Project,
+        shortSide: Int,
+        burnText: Boolean,
+        maxFps: Int = 30,
+        hdrMode: Int = Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL,
+        source: (Clip) -> Source = ::original,
+    ): Composition {
         val (w, h) = p.canvas(shortSide)
         var at = 0L
         val items = p.clips.map { c ->
-            val item = clipItem(p, c, at, w, h, burnText, maxFps)
+            val item = clipItem(p, c, source(c), at, w, h, burnText, maxFps)
             at += c.durMs
             item
         }
@@ -259,6 +276,10 @@ object Engine {
                     .build()
             }
         }
-        return Composition.Builder(sequences).build()
+        return Composition.Builder(sequences)
+            // Phones often shoot 4K in HDR. The output is always SDR H.264, so bring HDR footage
+            // down to SDR on the GPU instead of asking for an HDR pipeline end to end.
+            .setHdrMode(hdrMode)
+            .build()
     }
 }

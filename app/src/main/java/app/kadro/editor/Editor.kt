@@ -32,6 +32,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
@@ -62,6 +69,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -331,14 +339,31 @@ private fun Preview(s: Session, modifier: Modifier, onAdd: () -> Unit, onEditTex
         ) {
             if (s.export !is ExportState.Running) {
                 AndroidView(
-                    factory = { c -> SurfaceView(c).also { s.player.setVideoSurfaceView(it) } },
+                    factory = { c -> SurfaceView(c) },
+                    // Runs again whenever the session swaps in a new player or the canvas changes.
+                    update = { view ->
+                        // The picture is rendered at the project's canvas size and the system
+                        // scales it to the view. Opening a panel resizes the view; without a
+                        // fixed buffer a paused player would keep showing the old-size frame.
+                        view.holder.setFixedSize(cw, ch)
+                        s.player.setVideoSurfaceView(view)
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
+            val waiting = s.preparing
+            if (waiting.isNotEmpty()) PreparingCover(waiting)
             // Text lives above the video while editing so it can be dragged without re-rendering.
             val pickedId = (s.pick as? Pick.OfText)?.id
+            // Recompose only when a caption appears or disappears, not on every playback tick.
+            val shown by remember(s) {
+                derivedStateOf {
+                    val now = s.positionMs
+                    s.project.texts.filter { now >= it.startMs && now < it.endMs }.map { it.id }.toSet()
+                }
+            }
             s.project.texts.forEach { t ->
-                val visible = s.positionMs >= t.startMs && s.positionMs < t.endMs
+                val visible = t.id in shown
                 if ((visible || t.id == pickedId) && t.text.isNotBlank()) key(t.id) {
                     val bmp = remember(t.text, t.size, t.color, t.plate, t.bold, t.outline, boxW, boxH) {
                         Engine.renderText(t, boxW, boxH).asImageBitmap()
@@ -383,6 +408,39 @@ private fun Preview(s: Session, modifier: Modifier, onAdd: () -> Unit, onEditTex
                 }
             }
         }
+    }
+}
+
+/** Shown over the preview while heavy clips are being turned into light editing copies. */
+@Composable
+private fun PreparingCover(waiting: List<Clip>) {
+    val percent = waiting.firstNotNullOfOrNull { Proxies.progress[it.uri] } ?: 0
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Ink.Base)
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(
+                progress = { percent / 100f },
+                color = Ink.Ember, trackColor = Ink.Line, strokeWidth = 5.dp,
+                modifier = Modifier.size(84.dp),
+            )
+            Text("$percent%", color = Ink.Paper, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(14.dp))
+        Text(
+            if (waiting.size == 1) "Готовим 4K-видео к монтажу" else "Готовим 4K-видео: осталось ${waiting.size}",
+            color = Ink.Paper, fontSize = 15.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Делаем лёгкую копию для плавного монтажа — один раз на клип. В готовый ролик попадёт оригинальное качество.",
+            color = Ink.Dim, fontSize = 12.sp, lineHeight = 16.sp, textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -451,7 +509,7 @@ private fun Dock(s: Session, addMedia: () -> Unit, addMusic: () -> Unit, openPan
 }
 
 @Composable
-private fun Scrim(onDismiss: (() -> Unit)?, content: @Composable () -> Unit) {
+fun Scrim(onDismiss: (() -> Unit)?, content: @Composable () -> Unit) {
     Box(
         Modifier
             .fillMaxSize()
@@ -473,15 +531,23 @@ private fun Scrim(onDismiss: (() -> Unit)?, content: @Composable () -> Unit) {
 
 @Composable
 private fun RenameSheet(current: String, onDone: (String?) -> Unit) {
-    var name by remember { mutableStateOf(current) }
+    // Opens with the keyboard up and the old name selected, so typing replaces it.
+    var name by remember { mutableStateOf(TextFieldValue(current, TextRange(0, current.length))) }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
     Scrim(onDismiss = { onDone(null) }) {
         Text("Название проекта", color = Ink.Paper, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(12.dp))
         BasicTextField(
-            value = name, onValueChange = { name = it.take(40) }, singleLine = true,
+            value = name,
+            onValueChange = { v -> name = if (v.text.length <= 40) v else v.copy(text = v.text.take(40)) },
+            singleLine = true,
             textStyle = TextStyle(color = Ink.Paper, fontSize = 16.sp),
             cursorBrush = SolidColor(Ink.Ember),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { onDone(name.text.trim()) }),
             modifier = Modifier
+                .focusRequester(focus)
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(10.dp))
                 .background(Ink.Raised)
@@ -491,7 +557,7 @@ private fun RenameSheet(current: String, onDone: (String?) -> Unit) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Chip("Отмена", false) { onDone(null) }
             Spacer(Modifier.width(8.dp))
-            Chip("Сохранить", true) { onDone(name.trim()) }
+            Chip("Сохранить", true) { onDone(name.text.trim()) }
         }
     }
 }
@@ -516,10 +582,24 @@ private fun ExportSheet(s: Session, onClose: () -> Unit) {
                 Spacer(Modifier.height(16.dp))
                 Text("Качество", color = Ink.Dim, fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(480 to "480p", 720 to "720p HD", 1080 to "1080p").forEach { (v, l) ->
-                        Chip(l, side == v) { side = v }
-                    }
+                // 4K is offered when there is 4K footage to keep; weaker phones may encode less.
+                val has4k = s.project.clips.any { !it.isImage && minOf(it.width, it.height) >= 2000 }
+                val sizes = buildList {
+                    add(480 to "480p"); add(720 to "720p"); add(1080 to "1080p")
+                    if (has4k) add(2160 to "4K")
+                }
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    sizes.forEach { (v, l) -> Chip(l, side == v) { side = v } }
+                }
+                if (side == 2160) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "4K экспорт долгий и нагревает телефон. Если телефон не умеет кодировать 4K, размер будет уменьшен автоматически.",
+                        color = Ink.Dim, fontSize = 11.sp, lineHeight = 15.sp,
+                    )
                 }
                 Spacer(Modifier.height(16.dp))
                 Text("Кадров в секунду, не больше", color = Ink.Dim, fontSize = 12.sp)

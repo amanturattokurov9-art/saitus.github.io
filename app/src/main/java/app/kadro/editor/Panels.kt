@@ -105,7 +105,7 @@ fun VolumePanel(s: Session, c: Clip) {
         onChange = { v -> s.updateClip(c.id, live = true) { it.copy(volume = (v * 20).roundToInt() / 20f) } },
         onDone = { s.finishLive() },
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Chip("Без звука", c.volume == 0f) { s.updateClip(c.id) { it.copy(volume = 0f) } }
         Chip("100%", c.volume == 1f) { s.updateClip(c.id) { it.copy(volume = 1f) } }
         Chip("Громче ×2", c.volume == 2f) { s.updateClip(c.id) { it.copy(volume = 2f) } }
@@ -186,7 +186,7 @@ private fun signed(v: Float): String {
 
 @Composable
 fun FramePanel(s: Session, c: Clip) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Chip("Вписать", !c.fill) { s.updateClip(c.id) { it.copy(fill = false) } }
         Chip("Заполнить", c.fill) { s.updateClip(c.id) { it.copy(fill = true) } }
         Chip("Повернуть 90°", false) { s.updateClip(c.id) { it.copy(rotation = (it.rotation + 90) % 360) } }
@@ -281,7 +281,7 @@ fun TextPanel(s: Session, t: TextLayer) {
         onChange = { v -> s.updateText(t.id, live = true) { it.copy(size = v) } },
         onDone = { s.finishLive() },
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Toggle("Жирный", t.bold) { v -> s.updateText(t.id) { it.copy(bold = v) } }
         Toggle("Обводка", t.outline && !t.plate) { v -> s.updateText(t.id) { it.copy(outline = v, plate = false) } }
         Toggle("Плашка", t.plate) { v -> s.updateText(t.id) { it.copy(plate = v) } }
@@ -307,7 +307,7 @@ fun TextTimePanel(s: Session, t: TextLayer) {
         valueRange = 0f..total,
         colors = SliderDefaults.colors(thumbColor = Ink.Paper, activeTrackColor = Ink.Mint, inactiveTrackColor = Ink.Line),
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Chip("Начать с бегунка", false) {
             s.updateText(t.id) {
                 val a = s.positionMs.coerceAtMost((total - 200).toLong())
@@ -336,7 +336,7 @@ fun MusicPanel(s: Session, m: Music, onReplace: () -> Unit) {
         onChange = { v -> s.updateMusic(live = true) { it.copy(inMs = (v / 100).roundToLong() * 100) } },
         onDone = { s.finishLive() },
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Toggle("Повторять по кругу", m.loop) { v -> s.updateMusic { it.copy(loop = v) } }
         Chip("Заменить", false, onClick = onReplace)
         Chip("Приглушить видео", false) {

@@ -8,8 +8,10 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import android.webkit.MimeTypeMap
 import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.CoroutineScope
@@ -65,13 +67,20 @@ object MediaProbe {
             var h = (num(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) ?: 1920).toInt()
             val rot = (num(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION) ?: 0).toInt()
             if (rot % 180 != 0) { val t = w; w = h; h = t }
+            val frames = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
+            val fps = if (frames != null && dur > 0) frames * 1000f / dur else 30f
+            // 6 = SMPTE ST 2084 (HDR10), 7 = HLG: what phones record when HDR video is on.
+            val transfer = if (Build.VERSION.SDK_INT >= 30) num(MediaMetadataRetriever.METADATA_KEY_COLOR_TRANSFER) else null
+            val hdr = transfer == 6L || transfer == 7L
             Clip(
                 uri = uri.toString(), mime = mime.ifBlank { "video/mp4" }, isImage = false,
                 sourceMs = dur,
                 hasAudio = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) != null,
                 width = w, height = h, inMs = 0, outMs = dur,
+                heavy = maxOf(w, h) > HEAVY_SIDE || fps > 61f || hdr,
             )
         } catch (e: Exception) {
+            Log.w("Kadro", "cannot read $uri", e)
             null
         } finally {
             runCatching { r.release() }
@@ -91,6 +100,7 @@ object MediaProbe {
                 ?: "Музыка"
             Music(uri = uri.toString(), title = title, sourceMs = dur)
         } catch (e: Exception) {
+            Log.w("Kadro", "cannot read $uri", e)
             null
         } finally {
             runCatching { r.release() }
@@ -103,7 +113,16 @@ class Thumbs(private val ctx: Context) {
     private val worker = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + worker)
     private val pending = HashSet<String>()
-    private val retrievers = HashMap<String, MediaMetadataRetriever>()
+    /** Frames that could not be decoded; asking again on every redraw would only burn CPU. */
+    private val failed = HashSet<String>()
+    // Each open retriever holds native resources; keep only the few most recently used.
+    private val retrievers = object : LinkedHashMap<String, MediaMetadataRetriever>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MediaMetadataRetriever>): Boolean {
+            if (size <= 3) return false
+            runCatching { eldest.value.release() }
+            return true
+        }
+    }
 
     /** Compose reads this map; a new entry redraws the tiles that were waiting for it. */
     val ready = mutableStateMapOf<String, Bitmap>()
@@ -112,11 +131,16 @@ class Thumbs(private val ctx: Context) {
         val bucket = if (clip.isImage) 0 else sourceMs / 500 * 500
         val key = "${clip.uri}@$bucket"
         ready[key]?.let { return it }
+        // Heavy footage is never decoded here; its frames come from the light copy once it exists.
+        val source = Proxies.source(clip) ?: return null
+        if (!clip.isImage && clip.heavy && !Proxies.usesCopy(clip)) return null
+        if (key in failed) return null
         if (pending.add(key)) {
             scope.launch {
-                val bmp = runCatching { decode(clip, bucket) }.getOrNull()
+                val bmp = runCatching { decode(clip, source, bucket) }.getOrNull()
                 withContext(Dispatchers.Main) {
                     pending.remove(key)
+                    if (bmp == null) failed += key
                     if (bmp != null) {
                         if (ready.size > 300) ready.clear()
                         ready[key] = bmp
@@ -127,8 +151,7 @@ class Thumbs(private val ctx: Context) {
         return null
     }
 
-    private fun decode(clip: Clip, ms: Long): Bitmap? {
-        val uri = Uri.parse(clip.uri)
+    private fun decode(clip: Clip, uri: Uri, ms: Long): Bitmap? {
         if (clip.isImage) {
             val src = ImageDecoder.createSource(ctx.contentResolver, uri)
             return ImageDecoder.decodeBitmap(src) { d, info, _ ->
@@ -140,7 +163,7 @@ class Thumbs(private val ctx: Context) {
                 )
             }
         }
-        val r = retrievers.getOrPut(clip.uri) {
+        val r = retrievers.getOrPut(uri.toString()) {
             MediaMetadataRetriever().apply { setDataSource(ctx, uri) }
         }
         val land = clip.width >= clip.height

@@ -37,11 +37,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -54,22 +57,33 @@ class MainActivity : ComponentActivity() {
     private lateinit var drafts: Drafts
     private var session by mutableStateOf<Session?>(null)
     private var list by mutableStateOf<List<Project>>(emptyList())
+    private var crash by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val bar = SystemBarStyle.dark(0xFF101114.toInt())
         enableEdgeToEdge(statusBarStyle = bar, navigationBarStyle = bar)
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
+        crash = CrashLog.pending(this)
+        Proxies.init(this)
         drafts = Drafts(this)
         list = drafts.list()
+        Proxies.cleanup(list.flatMap { p -> p.clips.map { it.uri } })
         setContent {
             KadroTheme {
                 val s = session
                 if (s == null) {
                     Home(
                         list,
+                        crash = crash,
+                        onDismissCrash = { CrashLog.clear(this); crash = null },
                         onNew = { open(Project(name = "Проект ${list.size + 1}")) },
                         onOpen = ::open,
-                        onDelete = { drafts.delete(it.id); list = drafts.list() },
+                        onDelete = {
+                            drafts.delete(it.id)
+                            list = drafts.list()
+                            Proxies.cleanup(list.flatMap { p -> p.clips.map { c -> c.uri } })
+                        },
                     )
                 } else {
                     EditorScreen(s, onExit = ::leave)
@@ -92,10 +106,20 @@ class MainActivity : ComponentActivity() {
             Intent.ACTION_VIEW -> intent.data?.let(uris::add)
             Intent.ACTION_SEND ->
                 IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(uris::add)
-            Intent.ACTION_SEND_MULTIPLE ->
-                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(uris::addAll)
+            Intent.ACTION_SEND_MULTIPLE -> {
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                    ?.let(uris::addAll)
+                // Some apps put a single file here even when "sending several".
+                if (uris.isEmpty()) {
+                    IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(uris::add)
+                }
+                intent.clipData?.let { clip ->
+                    if (uris.isEmpty()) for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let(uris::add)
+                }
+            }
         }
         if (uris.isEmpty()) return
+        android.util.Log.i("Kadro", "received ${intent.action} with ${uris.size} file(s)")
         lifecycleScope.launch {
             val clips = withContext(Dispatchers.IO) { uris.mapNotNull { MediaProbe.clip(applicationContext, it) } }
             if (clips.isEmpty()) return@launch
@@ -132,10 +156,14 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun Home(
     drafts: List<Project>,
+    crash: String?,
+    onDismissCrash: () -> Unit,
     onNew: () -> Unit,
     onOpen: (Project) -> Unit,
     onDelete: (Project) -> Unit,
 ) {
+    var asking by remember { mutableStateOf<Project?>(null) }
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().background(Ink.Base).systemBarsPadding().padding(horizontal = 20.dp)) {
         Spacer(Modifier.height(28.dp))
         Row(verticalAlignment = Alignment.Bottom) {
@@ -163,6 +191,29 @@ private fun Home(
                 Text("Видео, фото, музыка, текст", color = Ink.Base.copy(alpha = 0.7f), fontSize = 13.sp)
             }
         }
+        if (crash != null) {
+            val clipboard = LocalClipboardManager.current
+            Spacer(Modifier.height(14.dp))
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Ink.Panel)
+                    .padding(14.dp),
+            ) {
+                Text("В прошлый раз приложение закрылось с ошибкой", color = Ink.Paper, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    crash, color = Ink.Dim, fontSize = 11.sp, lineHeight = 15.sp,
+                    maxLines = 6, overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Chip("Скопировать отчёт", true) { clipboard.setText(AnnotatedString(crash)) }
+                    Chip("Скрыть", false, onClick = onDismissCrash)
+                }
+            }
+        }
         Spacer(Modifier.height(28.dp))
         Text("Черновики", color = Ink.Paper, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(10.dp))
@@ -172,7 +223,7 @@ private fun Home(
                 color = Ink.Dim, fontSize = 13.sp, lineHeight = 19.sp,
             )
         }
-        val date = SimpleDateFormat("d MMM, HH:mm", Locale("ru"))
+        val date = SimpleDateFormat("d MMM HH:mm", Locale("ru"))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(drafts, key = { it.id }) { p ->
                 Row(
@@ -204,9 +255,27 @@ private fun Home(
                             color = Ink.Dim, fontSize = 12.sp,
                         )
                     }
-                    RoundIcon(Icons.Rounded.DeleteOutline, "Удалить", tint = Ink.Dim) { onDelete(p) }
+                    RoundIcon(Icons.Rounded.DeleteOutline, "Удалить", tint = Ink.Dim) { asking = p }
                 }
             }
         }
+    }
+    // A project is hours of work; one stray tap on the bin should not throw it away.
+    asking?.let { p ->
+        Scrim(onDismiss = { asking = null }) {
+            Text("Удалить «${p.name}»?", color = Ink.Paper, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Черновик удалится насовсем. Видео в галерее и исходные файлы останутся.",
+                color = Ink.Dim, fontSize = 13.sp, lineHeight = 18.sp,
+            )
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Chip("Отмена", false) { asking = null }
+                Spacer(Modifier.width(8.dp))
+                Chip("Удалить", true) { asking = null; onDelete(p) }
+            }
+        }
+    }
     }
 }

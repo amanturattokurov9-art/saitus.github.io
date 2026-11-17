@@ -30,6 +30,8 @@ data class Clip(
     val saturation: Float = 0f,
     val fadeInMs: Long = 0,
     val fadeOutMs: Long = 0,
+    /** 4K, high frame rate or HDR: edited through a light copy, see [Proxies]. */
+    val heavy: Boolean = false,
 ) {
     /** Length on the timeline after trim and speed. */
     val durMs: Long get() = ((outMs - inMs) / speed).toLong().coerceAtLeast(1)
@@ -102,6 +104,9 @@ data class Project(
         else even(shortSide.toFloat()) to even(shortSide * rh / rw)
     }
 }
+
+/** Footage whose long side is above this is treated as heavy (4K and up). */
+const val HEAVY_SIDE = 2000
 
 fun newId(): String = UUID.randomUUID().toString().take(8)
 
@@ -201,7 +206,7 @@ fun Project.toJson(): JSONObject = JSONObject().apply {
                 put("fill", c.fill); put("zoom", c.zoom.toDouble()); put("look", c.look)
                 put("brightness", c.brightness.toDouble()); put("contrast", c.contrast.toDouble())
                 put("saturation", c.saturation.toDouble())
-                put("fadeInMs", c.fadeInMs); put("fadeOutMs", c.fadeOutMs)
+                put("fadeInMs", c.fadeInMs); put("fadeOutMs", c.fadeOutMs); put("heavy", c.heavy)
             })
         }
     })
@@ -248,6 +253,7 @@ fun projectFromJson(o: JSONObject): Project {
                 contrast = c.optDouble("contrast", 0.0).toFloat(),
                 saturation = c.optDouble("saturation", 0.0).toFloat(),
                 fadeInMs = c.optLong("fadeInMs"), fadeOutMs = c.optLong("fadeOutMs"),
+                heavy = c.optBoolean("heavy", maxOf(c.optInt("width"), c.optInt("height")) > HEAVY_SIDE),
             )
         },
         texts = (0 until texts.length()).map { i ->
